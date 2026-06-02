@@ -1,0 +1,8 @@
+streamlit
+icalendar
+pandas
+reportlab
+google-genai
+python-dotenv
+recurring-ical-events
+openai
