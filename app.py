@@ -37,7 +37,8 @@ ROOM_LABELS = ["Room 1", "Room 2", "Room 3", "Room 4"]
 
 # ── Step 1: Month / Year selector ─────────────────────────────────────────────
 st.header("Step 1: Select Month & Year")
-col1, col2 = st.columns(2)
+
+col1, col2, col_pad = st.columns([1, 1, 2])
 with col1:
     selected_month_name = st.selectbox("Month", MONTHS, index=datetime.now().month - 1)
 with col2:
@@ -73,6 +74,9 @@ for label in ROOM_LABELS:
         if f is not None:
             room_bytes[label] = f.read()
             room_skipped[label] = False
+
+    if room_skipped[label] and room_bytes[label] is None:
+        st.caption(f"{label} skipped.")
 
 undecided = [
     label for label in ROOM_LABELS
@@ -153,6 +157,18 @@ if "employee_notes" not in st.session_state:
 
 employee_names = sorted(df["name"].unique().tolist())
 
+# ── Shared row-highlight function ─────────────────────────────────────────────
+def highlight_issues(row):
+    """Apply background colors based on manual flags, validation errors, or Special periods."""
+    if row.get("manually_flagged", False):
+        return ["background-color: #cce5ff"] * len(row)
+    if not row["valid"]:
+        if any("Special period" in i for i in row["issues"]):
+            return ["background-color: #fff3cd"] * len(row)
+        return ["background-color: #ffd6d6"] * len(row)
+    return [""] * len(row)
+
+
 # ── Step 3: Review Sessions ────────────────────────────────────────────────────
 st.header("Step 3: Review Sessions")
 
@@ -163,23 +179,12 @@ st.caption(
     "Invoices can still be generated with flagged entries, but review carefully before doing so."
 )
 
-
-def highlight_issues(row):
-    """Apply background colors to review rows based on manual flags, validation errors, or Special periods."""
-    if row.get("manually_flagged", False):
-        return ["background-color: #cce5ff"] * len(row)
-    if not row["valid"]:
-        if any("Special period" in i for i in row["issues"]):
-            return ["background-color: #fff3cd"] * len(row)
-        return ["background-color: #ffd6d6"] * len(row)
-    return [""] * len(row)
-
-
 review_cols = [
     "manually_flagged", "name", "game", "type", "period", "start", "end",
     "duration_hours", "room", "fee", "valid", "issues"
 ]
 review_df = df[review_cols].copy()
+review_df["Delete?"] = "—"
 review_df.index = range(1, len(review_df) + 1)
 styled_df = review_df.style.apply(highlight_issues, axis=1)
 
@@ -206,9 +211,31 @@ edited_review = st.data_editor(
         "fee": st.column_config.NumberColumn(disabled=True, format="%.2f"),
         "valid": st.column_config.CheckboxColumn(disabled=True),
         "issues": st.column_config.ListColumn(),
+        "Delete?": st.column_config.SelectboxColumn(
+            label="🗑️ DELETE?",
+            help="Select DELETE to instantly remove this row. THIS CANNOT BE UNDONE!",
+            options=["—", "DELETE"],
+            default="—",
+            required=True,
+        ),
     },
 )
 
+# Handle instant deletion — check delete column first
+delete_mask = edited_review["Delete?"].values
+if any(v == "DELETE" for v in delete_mask):
+    display_to_df_index = {display_i + 1: df_i for display_i, df_i in enumerate(df.index)}
+    rows_to_delete = [
+        display_to_df_index[display_i + 1]
+        for display_i, val in enumerate(delete_mask)
+        if val == "DELETE"
+    ]
+    df = df.drop(index=rows_to_delete)
+    st.session_state["df"] = df
+    st.session_state["editor_key"] = st.session_state.get("editor_key", 0) + 1
+    st.rerun()
+
+# Handle manual flag changes (only if no deletions happened)
 edited_flags = edited_review["manually_flagged"].values
 current_flags = df["manually_flagged"].values
 if list(edited_flags) != list(current_flags):
@@ -235,20 +262,34 @@ if not needs_fix.empty:
     )
 
     editable_cols = ["name", "game", "type", "start", "end", "room", "period"]
-    flagged_display = df.loc[needs_fix.index, editable_cols].copy()
-    flagged_display.index = range(1, len(flagged_display) + 1)
+
+    # Build a styled version that includes valid/issues/manually_flagged for coloring,
+    # but only expose the editable columns to the editor via column_config hiding the rest.
+    flagged_style_df = df.loc[needs_fix.index, editable_cols + ["valid", "issues", "manually_flagged"]].copy()
+    flagged_style_df.index = range(1, len(flagged_style_df) + 1)
+    styled_flagged = flagged_style_df.style.apply(highlight_issues, axis=1)
 
     edited = st.data_editor(
-        flagged_display,
+        styled_flagged,
         width="stretch",
         height=300,
         key=f"editor_{st.session_state.get('editor_key', 0)}",
         column_config={
+            "name": st.column_config.TextColumn(),
+            "game": st.column_config.TextColumn(),
+            "type": st.column_config.TextColumn(),
+            "start": st.column_config.DatetimeColumn(),
+            "end": st.column_config.DatetimeColumn(),
+            "room": st.column_config.TextColumn(),
             "period": st.column_config.SelectboxColumn(
                 label="Period",
                 options=["Off-peak", "M-Th-night", "Peak", "Special"],
                 required=True,
             ),
+            # Hide the styling-only columns from the user
+            "valid": None,
+            "issues": None,
+            "manually_flagged": None,
         },
     )
 
@@ -395,10 +436,10 @@ for employee, group in df.groupby("name"):
             st.markdown("**Additional Fees/Credits**")
             extra_display = pd.DataFrame([
                 {
-                    "DELETE? This cannot be undone!": False,
                     "Fee/Credit Type": e["type"],
                     "Amount ($)": e["amount"],
                     "Notes": e["notes"],
+                    "Delete?": "—",
                 }
                 for e in extra
             ])
@@ -408,12 +449,16 @@ for employee, group in df.groupby("name"):
                 extra_display,
                 key=f"extra_{employee}_{st.session_state.get('editor_key', 0)}",
                 column_config={
-                    "DELETE? This cannot be undone!": st.column_config.CheckboxColumn(
-                        label="DELETE? This cannot be undone!"
-                    ),
                     "Fee/Credit Type": st.column_config.TextColumn(disabled=True),
                     "Amount ($)": st.column_config.NumberColumn(disabled=True, format="%.2f"),
                     "Notes": st.column_config.TextColumn(disabled=True),
+                    "Delete?": st.column_config.SelectboxColumn(
+                        label="🗑️ DELETE?",
+                        help="Select DELETE to instantly remove this entry. THIS CANNOT BE UNDONE!",
+                        options=["—", "DELETE"],
+                        default="—",
+                        required=True,
+                    ),
                 },
                 hide_index=False,
                 width="stretch",
@@ -421,7 +466,7 @@ for employee, group in df.groupby("name"):
 
             to_keep = [
                 entry for i, entry in enumerate(extra)
-                if not edited_extra.iloc[i]["DELETE? This cannot be undone!"]
+                if edited_extra.iloc[i]["Delete?"] != "DELETE"
             ]
             if len(to_keep) < len(extra):
                 st.session_state["extra_fees"][employee] = to_keep
@@ -429,9 +474,31 @@ for employee, group in df.groupby("name"):
 
         # ── Session fees ───────────────────────────────────────────────────────
         st.markdown("**Session Fees**")
-        st.dataframe(
-            group[["game", "type", "period", "start", "room", "duration_hours", "fee"]],
+
+        session_display_cols = ["game", "type", "period", "start", "room", "duration_hours", "fee"]
+        session_display = group[session_display_cols + ["valid", "issues", "manually_flagged"]].copy()
+        session_display.index = range(1, len(session_display) + 1)
+        styled_session = session_display.style.apply(highlight_issues, axis=1)
+
+        st.data_editor(
+            styled_session,
+            key=f"session_preview_{employee}_{st.session_state.get('editor_key', 0)}",
+            column_config={
+                "game": st.column_config.TextColumn(disabled=True),
+                "type": st.column_config.TextColumn(disabled=True),
+                "period": st.column_config.TextColumn(disabled=True),
+                "start": st.column_config.DatetimeColumn(disabled=True),
+                "room": st.column_config.TextColumn(disabled=True),
+                "duration_hours": st.column_config.NumberColumn(disabled=True, format="%.2f"),
+                "fee": st.column_config.NumberColumn(disabled=True, format="%.2f"),
+                # Hide styling-only columns
+                "valid": None,
+                "issues": None,
+                "manually_flagged": None,
+            },
+            hide_index=False,
             width="stretch",
+            disabled=True,
         )
 
         if has_issues:
@@ -439,6 +506,10 @@ for employee, group in df.groupby("name"):
 
 # ── Step 7: Generate Invoices ──────────────────────────────────────────────────
 st.header("Step 7: Generate Invoices")
+st.caption(
+    "⚠️ Progress is lost when you close the app, so remember to download both .csv files "
+    "at the end of your session!"
+)
 
 if st.button("Generate All Invoices", type="secondary"):
     zip_buffer = io.BytesIO()
